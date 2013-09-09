@@ -2,6 +2,7 @@
 import re
 import redis
 import cPickle
+from string import maketrans
 
 REAL_WORD_KEY = 'store.key.real_words'
 FAKE_WORD_KEY = 'store.key.fake_words'
@@ -10,6 +11,48 @@ pool = redis.ConnectionPool(host='localhost', port=6379, db=0)
 r = redis.Redis(connection_pool=pool)
 pipe = r.pipeline(transaction=False)
 
+class Sentence:
+    SYMBOL = u',./-{}[]\'\";:+=_-)(*&^%$#@!~`，。；：“！@#￥%……&*（）——-『』【】|、'
+    EN_CHARS = u'zxcvbnmasdfghjklpoiuytrewqQWERTYUIOPLKJHGFDSAZXCVBNM'
+    NUMBER_CHARS = u'1234567890'
+
+    NONE = 0
+    REMOVE_NUMBER = 1
+    REMOVE_ENGLISH = 2
+
+    def __init__(self, model=0):
+        block = self.SYMBOL
+        if model & self.REMOVE_NUMBER:
+            block += self.NUMBER_CHARS
+        if model & self.REMOVE_ENGLISH:
+            block += self.EN_CHARS
+        # space = ' '*len(block)
+        self.translate_table = dict((ord(char), u' ') for char in block)
+        self.model = model
+        self.word = Words()
+
+    def _remove_symbol(self, strs):
+        '''remove symbol in string'''
+        return strs.translate(self.translate_table)
+
+    def read(self, f):
+        if isinstance(f, file):
+            f = open(f, 'r').read()
+            f = unicode(f, 'utf8')
+        elif isinstance(f, str):
+            f = unicode(f, 'utf8')
+        assert isinstance(f, unicode), 'parameter error'
+        f = self._remove_symbol(f)
+        self.str_list = f.split()
+
+    def segmentation(self, stream):
+        self.read(stream)
+        l = []
+        for sentence in self.str_list:
+            words = self.word.segmentation(sentence)
+            l.append(words)
+            self.word.leaning(words)
+        return l
 
 class Words:
     REAL_WORD_KEY = 'store.key.real_words'
@@ -17,6 +60,12 @@ class Words:
     dictionary_path = 'yyx_segmentation_dictionary'
     MAX_LENGTH = 7
     TOTAL_COUNT = -1
+    SYMBOL = u',./-{}[]\'\";:+=_-)(*&^%$#@!~`，。；：“！@#￥%……&*（）——-『』【】|、'
+
+    REMOVE_NUMBER = 1
+    REMOVE_ENGILSH = 2
+    EN_CHARS = u'zxcvbnmasdfghjklpoiuytrewqQWERTYUIOPLKJHGFDSAZXCVBNM'
+    NUMBER_CHARS = u'1234567890'
 
     variance = lambda self, avg_num, data_list: sum([(data - avg_num)**2 for data in data_list]) / len(data_list)
     create_new_word = lambda self, *x: u''.join(x)
@@ -50,7 +99,7 @@ class Words:
         Parameter:
             words: a list of word
         '''
-        frequency = [f if f else 0 for f in r.hmget(self.FAKE_WORD_KEY, *words)]
+        frequency = [f if f else 0 for f in r.hmget(self.FAKE_WORD_KEY, *new_words)]
         return frequency
 
     def _get_probablity_new_words(self, new_words):
@@ -105,13 +154,13 @@ class Words:
         while (count < length):
             wl = l[count]
             t = count
-            while wl < self.MAX_LENGTH:
+            while wl < self.MAX_LENGTH and t < length - 1:
                 t += 1
                 wl += l[t]
-            if t != count:
-                new_word = self.create_new_word(words[count:t+1])
-                new_words_dict[new_word] = (self.create_new_word(words[count:t]), words[t])
-                new_words_count[new_word] = new_words_count.get(new_word) + 1
+                if t != count:
+                    new_word = self.create_new_word(*words[count:t+1])
+                    new_words_dict[new_word] = (self.create_new_word(*words[count:t]), words[t])
+                    new_words_count[new_word] = new_words_count.get(new_word, 0) + 1
             count += 1
         # now we have got all new words.
         new_words = new_words_count.keys()
@@ -123,13 +172,14 @@ class Words:
                 # when the count above 1000, we shoud check does it is a real new word
                 if self._check_probablity(new_words_count[word], new_words_dict[word]):
                     real_words[word] = new_words_count[word]
-                    # self._add_words(word, new_words_count[word])
                     del new_words_count[word]
         # update words frequency
-        print new_words_count
-        print real_words
-        # self._update_new_words_frequency(new_words_count)
-        # self._add_words(real_words)
+        # print 'new words'
+        # for key, value in new_words_count.items(): print key, value 
+        # print 'real words'
+        # for key, value in real_words.items(): print key, value 
+        self._update_new_words_frequency(new_words_count)
+        self._add_words(real_words)
 
     def _check_probablity(self, word, frequency, l):
         '''check does it is a real word'''
@@ -156,12 +206,13 @@ class Words:
         end = length
         words_reverse = []
         while start > 0:
-            while self.match_word(sentence[start - 1:end]) and start - 1 > 0:
+            while self.match_word(sentence[start - 1:end]) and start - 1 >= 0:
                 start -= 1
             words_reverse.append(sentence[start:end])
             end = start
             start -= 1
-        words_reverse.append(sentence[start:end])
+        if start >= 0:
+            words_reverse.append(sentence[start:end])
         words = []
         start = 0
         end = 1
@@ -171,44 +222,26 @@ class Words:
             words.append(sentence[start:end])
             start = end
             end += 1
-        words.append(sentence[start:end])
+        if end <= length:
+            words.append(sentence[start:end])
         l1 = len(words)
-        l2 = len(words_reverse)                            
+        l2 = len(words_reverse)                 
         if l1 > l2:
-            return words
+            return words_reverse[::-1]
         elif l2 > l1:
-            return words_reverse
+            return words
         else:
-            avg_l1 = l1 / length
-            avg_l2 = l2 / length
-            if avg_l1 > avg_l2:
+            avg_l = float(l1) / length
+            v1 = self.variance(avg_l, [len(word) for word in words])
+            v2 = self.variance(avg_l, [len(word) for word in words_reverse])
+            if v1 < v2:
                 return words
-            elif avg_l2 >avg_l1:
-                return words_reverse
+            elif v2 < v1:
+                return words_reverse[::-1]
             else:
-                v1 = self.variance(avg_l1, [len(word) for word in words])
-                v2 = self.variance(avg_l2, [len(word) for word in words_reverse])
-                if v1 < v2:
+                p1 = self.analysic(words)
+                p2 = self.analysic(words_reverse)
+                if p1 > p2:
                     return words
-                elif v2 < v1:
-                    return words_reverse
                 else:
-                    p1 = self.analysic(words)
-                    p2 = self.analysic(words_reverse)
-                    if p1 > p2:
-                        return words
-                    else:
-                        return words_reverse
-
-_words = Words()
-_SPILT_RE = re.compile(u'[,|.|;|\'|\[|\]|{|}|!|@|#|$|%|^|&|*|\\|"|:|`|~|-|_|=|+|。|，|；|‘|“|]')
-def segmentation(sentence):
-    if not isinstance(sentence, unicode):
-        sentence = unicode(sentence, 'utf8')
-
-    l = _SPILT_RE.split(sentence)
-    for i in l:print i
-    words = []
-    for i in l:
-        words += _words.segmentation(i.strip())
-    return words
+                    return words_reverse[::-1]
